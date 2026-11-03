@@ -114,6 +114,168 @@ class PulseProcessor:
         return {"bpm": bpm, "cv": cv, "n": len(ibi), "quality": quality}
 
 
+class PulsePresenceDetector:
+    """Detect whether a body/pulse signal is present above a no-body baseline.
+
+    The first ``calibration_s`` seconds must be recorded with no body part on the
+    sensor and the sensor kept still.  The detector learns:
+
+    * the no-body DC level of Ch0, and
+    * the normal pulse-band (0.6-2.5 Hz) noise floor.
+
+    After calibration, a signal is considered present only when BOTH the Ch0 DC
+    level has moved away from the no-body level and the pulse-band RMS is above
+    the learned noise floor.  This is a practical presence gate, not a medical
+    contact detector; the live diagnostic values are exposed so thresholds can
+    be tuned from real recordings.
+    """
+
+    def __init__(
+        self,
+        fs: float = 50.0,
+        calibration_s: float = 5.0,
+        window_s: float = 2.0,
+        dc_window_s: float = 0.5,
+        contact_floor: float = 0.00025,
+        contact_sigma: float = 6.0,
+        energy_ratio: float = 1.10,
+        energy_floor: float = 0.000003,
+        on_s: float = 0.4,
+        off_s: float = 0.5,
+    ) -> None:
+        self.fs = fs
+        self.calibration_samples = max(1, int(round(calibration_s * fs)))
+        self.window_samples = max(2, int(round(window_s * fs)))
+        self.dc_window_samples = max(2, int(round(dc_window_s * fs)))
+        self.contact_floor = contact_floor
+        self.contact_sigma = contact_sigma
+        self.energy_ratio = energy_ratio
+        self.energy_floor = energy_floor
+        self.on_samples = max(1, int(round(on_s * fs)))
+        self.off_samples = max(1, int(round(off_s * fs)))
+
+        self._sos = signal.butter(
+            2, [0.6, 2.5], "bandpass", fs=fs, output="sos"
+        )
+        self._zi0 = signal.sosfilt_zi(self._sos)
+        self.reset()
+
+    def reset(self) -> None:
+        self.calibrated = False
+        self.present = False
+
+        self.baseline_dc = NAN
+        self.baseline_dc_sigma = NAN
+        self.baseline_band_rms = NAN
+        self.contact_threshold = NAN
+        self.band_threshold = NAN
+
+        self.contact_shift = 0.0
+        self.band_rms = 0.0
+
+        self._cal_raw: List[float] = []
+        self._cal_band: List[float] = []
+        self._band: Deque[float] = deque(maxlen=self.window_samples)
+        self._dc: Deque[float] = deque(maxlen=self.dc_window_samples)
+
+        self._zi: Optional[np.ndarray] = None
+        self._on_count = 0
+        self._off_count = 0
+
+    def _finalize_calibration(self) -> None:
+        raw = np.asarray(self._cal_raw, dtype=float)
+        band = np.asarray(self._cal_band, dtype=float)
+
+        self.baseline_dc = float(np.median(raw))
+
+        # Estimate slow DC stability from 0.5 s block medians instead of raw
+        # samples so the repeating electrical line does not inflate the contact
+        # threshold unnecessarily.
+        block = self.dc_window_samples
+        medians = [
+            float(np.median(raw[i:i + block]))
+            for i in range(0, len(raw) - block + 1, block)
+        ]
+        if len(medians) >= 2:
+            m = np.asarray(medians, dtype=float)
+            mm = float(np.median(m))
+            mad = float(np.median(np.abs(m - mm)))
+            self.baseline_dc_sigma = 1.4826 * mad
+        else:
+            mad = float(np.median(np.abs(raw - self.baseline_dc)))
+            self.baseline_dc_sigma = 1.4826 * mad
+
+        # Ignore the first second when estimating pulse-band noise so filter
+        # startup contributes as little as possible.
+        skip = min(int(round(self.fs)), max(0, len(band) - 1))
+        use = band[skip:] if len(band[skip:]) else band
+        self.baseline_band_rms = float(np.sqrt(np.mean(use * use)))
+
+        self.contact_threshold = max(
+            self.contact_floor,
+            self.contact_sigma * self.baseline_dc_sigma,
+        )
+        self.band_threshold = max(
+            self.baseline_band_rms * self.energy_ratio,
+            self.baseline_band_rms + self.energy_floor,
+        )
+
+        self.calibrated = True
+        self.present = False
+        self._band.clear()
+        self._dc.clear()
+        self._on_count = 0
+        self._off_count = 0
+
+    def push(self, x: float) -> bool:
+        if self._zi is None:
+            self._zi = self._zi0 * x
+
+        y_arr, self._zi = signal.sosfilt(self._sos, [x], zi=self._zi)
+        y = float(y_arr[0])
+
+        if not self.calibrated:
+            self._cal_raw.append(float(x))
+            self._cal_band.append(y)
+            if len(self._cal_raw) >= self.calibration_samples:
+                self._finalize_calibration()
+            return False
+
+        self._band.append(y)
+        self._dc.append(float(x))
+
+        if (
+            len(self._band) < self._band.maxlen
+            or len(self._dc) < self._dc.maxlen
+        ):
+            self.present = False
+            return False
+
+        current_dc = float(np.median(np.asarray(self._dc, dtype=float)))
+        self.contact_shift = abs(current_dc - self.baseline_dc)
+
+        b = np.asarray(self._band, dtype=float)
+        self.band_rms = float(np.sqrt(np.mean(b * b)))
+
+        candidate = (
+            self.contact_shift >= self.contact_threshold
+            and self.band_rms >= self.band_threshold
+        )
+
+        if candidate:
+            self._on_count += 1
+            self._off_count = 0
+            if self._on_count >= self.on_samples:
+                self.present = True
+        else:
+            self._off_count += 1
+            self._on_count = 0
+            if self._off_count >= self.off_samples:
+                self.present = False
+
+        return self.present
+
+
 class RateTracker:
     """Heart-rate estimate from the repeating rhythm over a sliding window.
 
